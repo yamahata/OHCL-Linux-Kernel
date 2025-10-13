@@ -151,6 +151,17 @@ union hv_register_vsm_page_offsets {
 	u64 as_uint64;
 } __packed;
 
+#define MSHV_VTL_NUM_L2_VM	3
+#define TDVPS_TSC_DEADLINE_DISARMED	(~0ULL)
+
+#define TDVPS_TSC_DEADLINE	0xA020000300000058ULL
+
+#define TDG_VP_ENTRY_VM_SHIFT	52
+#define TDG_VP_ENTRY_VM_MASK	GENMASK_ULL(53, 52)
+#define TDG_VP_ENTRY_VM_IDX(entry_rcx)			\
+	(((entry_rcx) & TDG_VP_ENTRY_VM_MASK) >>	\
+	 TDG_VP_ENTRY_VM_SHIFT)
+
 struct mshv_vtl_per_cpu {
 	struct mshv_vtl_run *run;
 	struct page *reg_page;
@@ -164,6 +175,7 @@ struct mshv_vtl_per_cpu {
 	u64 l1_msr_lstar;
 	u64 l1_msr_sfmask;
 	u64 l1_msr_tsc_aux;
+	u64 l2_tsc_deadline_prev[MSHV_VTL_NUM_L2_VM];
 	bool msrs_are_guest;
 	struct user_return_notifier mshv_urn;
 #endif
@@ -613,6 +625,7 @@ static int mshv_vtl_alloc_context(unsigned int cpu)
 	if (hv_isolation_type_tdx()) {
 #if defined(CONFIG_X86_64) && defined(CONFIG_INTEL_TDX_GUEST)
 		struct page *tdx_apic_page;
+		int vm_idx;
 
 		tdx_apic_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
 		if (!tdx_apic_page)
@@ -633,6 +646,15 @@ static int mshv_vtl_alloc_context(unsigned int cpu)
 
 		/* Enable the apic page. */
 		mshv_write_tdx_apic_page(page_to_phys(tdx_apic_page));
+
+		mshv_vtl_this_run()->tdx_context.l2_tsc_deadline.deadline =
+			MSHV_VTL_TDX_L2_DEADLINE_DISARMED;
+		for (vm_idx = 1; vm_idx <= MSHV_VTL_NUM_L2_VM; vm_idx++) {
+			u64 deadline = TDVPS_TSC_DEADLINE_DISARMED;
+
+			tdg_vp_wr(TDVPS_TSC_DEADLINE + vm_idx, deadline, ~0ULL);
+			per_cpu->l2_tsc_deadline_prev[vm_idx - 1] = deadline;
+		}
 #endif
 	} else if (hv_isolation_type_snp()) {
 #ifdef CONFIG_X86_64
@@ -857,6 +879,60 @@ static void mshv_vtl_on_user_return(struct user_return_notifier *urn)
 	wrmsrl(MSR_TSC_AUX, per_cpu->l1_msr_tsc_aux);
 }
 
+static void mshv_vtl_return_tdx_tsc_deadline(struct mshv_vtl_run *vtl_run)
+{
+	struct mshv_vtl_per_cpu *per_cpu = this_cpu_ptr(&mshv_vtl_per_cpu);
+	struct tdx_vp_context *context = &vtl_run->tdx_context;
+	u64 vm_idx, deadline;
+
+	if (!(context->l2_tsc_deadline.update & MSHV_VTL_TDX_L2_DEADLINE_UPDATE))
+		return;
+
+	/* L2 VM index is encoded in entry_rcx for TDG.VP.ENTER(). */
+	vm_idx = TDG_VP_ENTRY_VM_IDX(vtl_run->tdx_context.entry_rcx);
+	if (vm_idx == 0 || vm_idx > MSHV_VTL_NUM_L2_VM)
+		return;
+
+	deadline = context->l2_tsc_deadline.deadline;
+
+	/*
+	 * Convert SDM TSC deadline to TDX TD partitioning guest timer service.
+	 * SDM: tdx_vp_context.tsc_deadline follows this.
+	 * 0: disarmed.
+	 * -1: armed. As it's far future, it won't fire in practical time.
+	 *
+	 * TDX
+	 * 0: immediate inject timer interrupt.
+	 * -1: disarmed.
+	 * -2: this can be considered as far future.
+	 */
+	if (deadline == MSHV_VTL_TDX_L2_DEADLINE_DISARMED)
+		deadline = TDVPS_TSC_DEADLINE_DISARMED;
+	if (deadline == ~0ULL)
+		deadline = ~0ULL - 1ULL;
+
+	if (deadline != per_cpu->l2_tsc_deadline_prev[vm_idx - 1]) {
+		tdg_vp_wr(TDVPS_TSC_DEADLINE + vm_idx, deadline, ~0ULL);
+		per_cpu->l2_tsc_deadline_prev[vm_idx - 1] = deadline;
+	}
+
+	/* Tell the userspace that the kernel set the deadline */
+	context->l2_tsc_deadline.update &= ~MSHV_VTL_TDX_L2_DEADLINE_UPDATE;
+}
+
+static void mshv_tdx_tsc_deadline_expired(struct mshv_vtl_run *run)
+{
+	struct tdx_vp_context *context = &run->tdx_context;
+	struct mshv_vtl_per_cpu *per_cpu = this_cpu_ptr(&mshv_vtl_per_cpu);
+	u64 vm_idx;
+
+	vm_idx = TDG_VP_ENTRY_VM_IDX(context->entry_rcx);
+	if (vm_idx == 0 || vm_idx > MSHV_VTL_NUM_L2_VM)
+		return;
+
+	per_cpu->l2_tsc_deadline_prev[vm_idx - 1] = TDVPS_TSC_DEADLINE_DISARMED;
+}
+
 void mshv_vtl_return_tdx(void)
 {
 	struct tdx_tdg_vp_enter_exit_info *tdx_exit_info;
@@ -868,6 +944,8 @@ void mshv_vtl_return_tdx(void)
 	tdx_exit_info = &vtl_run->tdx_context.exit_info;
 	tdx_vp_state = &vtl_run->tdx_context.vp_state;
 	per_cpu = this_cpu_ptr(&mshv_vtl_per_cpu);
+
+	mshv_vtl_return_tdx_tsc_deadline(vtl_run);
 
 	kernel_fpu_begin_mask(0);
 	fxrstor(&vtl_run->tdx_context.fx_state); // restore FP reg and XMM regs
@@ -1280,6 +1358,11 @@ static bool mshv_tdx_is_idle(const struct tdx_vp_context *context)
 		(u32)context->l2_enter_guest_state.rcx == HV_X64_MSR_GUEST_IDLE;
 }
 
+static bool mshv_tdx_is_preemption_timer(const struct tdx_vp_context *context)
+{
+	return ((u32)context->exit_info.rax) == EXIT_REASON_PREEMPTION_TIMER;
+}
+
 static void mshv_tdx_handle_hlt_idle(struct tdx_vp_context *context)
 {
     const u64 VP_WRITE = 10;
@@ -1321,6 +1404,11 @@ static bool mshv_tdx_try_handle_exit(struct mshv_vtl_run *run)
 	const bool intr_inject = MSHV_VTL_OFFLOAD_FLAG_INTR_INJECT & run->offload_flags;
 	const bool x2apic = MSHV_VTL_OFFLOAD_FLAG_X2APIC & run->offload_flags;
 	bool ret_to_user = true;
+
+	if (mshv_tdx_is_preemption_timer(context)) {
+		mshv_tdx_tsc_deadline_expired(run);
+		return true;
+	}
 
 	if (!intr_inject || mshv_tdx_next_intr_exists(context))
 		return false;

@@ -1325,6 +1325,17 @@ static bool mshv_tdx_next_intr_exists(const struct tdx_vp_context *context)
 	return next_intr & BIT(31);
 }
 
+static void mshv_tdx_clear_halt_flags(struct mshv_vtl_run *run)
+{
+	u8 *offload_flags = &run->offload_flags;
+
+	(*offload_flags) &= ~MSHV_VTL_OFFLOAD_FLAG_HALT_HLT;
+	(*offload_flags) &= ~MSHV_VTL_OFFLOAD_FLAG_HALT_IDLE;
+
+	if (!(*offload_flags & MSHV_VTL_OFFLOAD_FLAG_HALT_OTHER))
+		run->flags &= ~MSHV_VTL_RUN_FLAG_HALTED;
+}
+
 static void mshv_tdx_update_rvi_halt(struct mshv_vtl_run *run)
 {
 	u32 *apic_page_irr = mshv_tdx_vapic_irr();
@@ -1338,13 +1349,8 @@ static void mshv_tdx_update_rvi_halt(struct mshv_vtl_run *run)
 		}
 	}
 
-	if (enter_state->rvi) {
-		u8 *offload_flags = &run->offload_flags;
-		(*offload_flags) &= ~MSHV_VTL_OFFLOAD_FLAG_HALT_HLT;
-		(*offload_flags) &= ~MSHV_VTL_OFFLOAD_FLAG_HALT_IDLE;
-		if (!(*offload_flags & MSHV_VTL_OFFLOAD_FLAG_HALT_OTHER))
-			run->flags &= ~MSHV_VTL_RUN_FLAG_HALTED;
-	}
+	if (enter_state->rvi)
+		mshv_tdx_clear_halt_flags(run);
 }
 
 static bool mshv_tdx_is_hlt(const struct tdx_vp_context *context)

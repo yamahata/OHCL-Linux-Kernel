@@ -933,6 +933,15 @@ static void mshv_tdx_tsc_deadline_expired(struct mshv_vtl_run *run)
 	per_cpu->l2_tsc_deadline_prev[vm_idx - 1] = TDVPS_TSC_DEADLINE_DISARMED;
 }
 
+static bool mshv_tdx_is_tsc_deadline_expired(struct mshv_vtl_run *run)
+{
+	struct tdx_vp_context *context = &run->tdx_context;
+	u64 tsc_deadline = context->l2_tsc_deadline.deadline;
+
+	return tsc_deadline != MSHV_VTL_TDX_L2_DEADLINE_DISARMED &&
+		tsc_deadline <= rdtsc_ordered();
+}
+
 void mshv_vtl_return_tdx(void)
 {
 	struct tdx_tdg_vp_enter_exit_info *tdx_exit_info;
@@ -1452,6 +1461,11 @@ static bool mshv_pull_proxy_irr(struct mshv_vtl_run *run)
 #ifdef CONFIG_INTEL_TDX_GUEST
 	ret = mshv_tdx_pull_proxy_irr(run);
 	mshv_tdx_update_rvi_halt(run);
+	if (mshv_tdx_is_tsc_deadline_expired(run)) {
+		mshv_tdx_tsc_deadline_expired(run);
+		mshv_tdx_clear_halt_flags(run);
+		ret = true;
+	}
 #endif
 	return ret;
 }

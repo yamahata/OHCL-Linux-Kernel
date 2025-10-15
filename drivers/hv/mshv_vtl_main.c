@@ -180,6 +180,20 @@ static DEFINE_PER_CPU(struct mshv_vtl_poll_file, mshv_vtl_poll_file);
 static DEFINE_PER_CPU(unsigned long long, num_vtl0_transitions);
 static DEFINE_PER_CPU(struct mshv_vtl_per_cpu, mshv_vtl_per_cpu);
 
+#if defined(CONFIG_X86_64) && defined(CONFIG_INTEL_TDX_GUEST)
+static DEFINE_PER_CPU(struct hrtimer, mshv_tdx_halt_timer);
+static struct hrtimer *tdx_this_halt_timer(void)
+{
+	return this_cpu_ptr(&mshv_tdx_halt_timer);
+}
+static void mshv_tdx_init_halt_timer(void);
+#else
+static struct hrtimer *tdx_this_halt_timer(void)
+{
+	return NULL;
+}
+#endif
+
 noinline void mshv_vtl_return_tdx(void);
 struct mshv_vtl_run *mshv_vtl_this_run(void);
 void mshv_tdx_request_cache_flush(bool wbnoinvd);
@@ -638,6 +652,8 @@ static int mshv_vtl_alloc_context(unsigned int cpu)
 		/* Enable the apic page. */
 		mshv_write_tdx_apic_page(page_to_phys(tdx_apic_page));
 
+		mshv_tdx_init_halt_timer();
+
 		mshv_vtl_this_run()->tdx_context.tsc_deadline = 0;
 		for (vm_idx = 1; vm_idx <= MSHV_VTL_NUM_L2_VM; vm_idx++) {
 			u64 deadline = TDVPS_TSC_DEADLINE_DISARMED;
@@ -1013,6 +1029,93 @@ static bool mshv_vtl_process_intercept(void)
 	return false;
 }
 
+#if defined(CONFIG_INTEL_TDX_GUEST)
+static enum hrtimer_restart mshv_tdx_timer_fn(struct hrtimer *timer)
+{
+	/*
+	 * The purpose is to get interupt on this vCPU to wake up from
+	 * VMM HLT emulation.
+	 */
+	return HRTIMER_NORESTART;
+}
+
+static void mshv_tdx_init_halt_timer(void)
+{
+	struct hrtimer *timer = tdx_this_halt_timer();
+
+	if (!timer)
+		return;
+
+	hrtimer_init(timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+	timer->function = mshv_tdx_timer_fn;
+}
+#endif
+
+enum TDX_HALT_TIMER {
+	TIMER_ARMED,
+	TIMER_NOTARMED,
+	TIMER_EXPIRED,
+};
+
+static enum TDX_HALT_TIMER mshv_tdx_setup_halt_timer(void)
+{
+	struct hrtimer *timer = tdx_this_halt_timer();
+	u64 deadline = 0, now = 0;
+	ktime_t time;
+
+	if (!timer)
+		return TIMER_NOTARMED;
+
+#ifdef CONFIG_X86_64
+	deadline = mshv_vtl_this_run()->tdx_context.tsc_deadline;
+	now = rdtsc();
+#endif
+	if (deadline == 0)
+		return TIMER_NOTARMED;
+
+	time = 0;
+	if (deadline > now){
+		/*
+		 * ktime_t is nsec.
+		 * (deadline - now) * 1000 * 1000 * 1000 / (tsc_khz * 1000);
+		 */
+		time = mul_u64_u64_div_u64(deadline - now, 1000 * 1000, tsc_khz);
+		if (time < 0)
+			time = KTIME_MAX;
+	}
+
+	if (time == 0)
+		return TIMER_EXPIRED;
+
+	hrtimer_start(timer, time, HRTIMER_MODE_REL_PINNED);
+	return TIMER_ARMED;
+}
+
+static void mshv_tdx_cancel_halt_timer(void)
+{
+	struct hrtimer *timer = tdx_this_halt_timer();
+
+	if (timer)
+		hrtimer_cancel(timer);
+}
+
+static bool mshv_tdx_halt_timer_pre(bool try_arm)
+{
+	if (!hv_isolation_type_tdx())
+		return TIMER_NOTARMED;
+
+	if (!try_arm)
+		return TIMER_NOTARMED;
+
+	return mshv_tdx_setup_halt_timer();
+}
+
+static void mshv_tdx_halt_timer_post(enum TDX_HALT_TIMER armed)
+{
+	if (armed == TIMER_ARMED)
+		mshv_tdx_cancel_halt_timer();
+}
+
 static bool in_idle_is_enabled;
 DEFINE_PER_CPU(struct task_struct *, mshv_vtl_thread);
 
@@ -1023,8 +1126,13 @@ static void mshv_vtl_switch_to_vtl0_irqoff(void)
 	struct hv_vtl_cpu_context *cpu_ctx = &this_run->cpu_context;
 	u32 flags = READ_ONCE(this_run->flags);
 	union hv_input_vtl target_vtl = READ_ONCE(this_run->target_vtl);
+	enum TDX_HALT_TIMER armed;
 
 	trace_mshv_vtl_enter_vtl0_rcuidle(cpu_ctx);
+
+	armed = mshv_tdx_halt_timer_pre(flags & MSHV_VTL_RUN_FLAG_HALTED);
+	if (armed == TIMER_EXPIRED)
+		return;
 
 	/* A VTL2 TDX kernel doesn't allocate hv_vp_assist_page at the moment */
 	hvp = hv_vp_assist_page ? hv_vp_assist_page[smp_processor_id()] : NULL;
@@ -1047,6 +1155,8 @@ static void mshv_vtl_switch_to_vtl0_irqoff(void)
 	}
 
 	hv_vtl_return(cpu_ctx, target_vtl, flags, mshv_vsm_page_offsets.vtl_return_offset);
+
+	mshv_tdx_halt_timer_post(armed);
 
 	if (!hvp)
 		return;
@@ -1077,7 +1187,15 @@ static void mshv_vtl_idle(void)
 		}
 		raw_local_irq_enable();
 	} else {
+		enum TDX_HALT_TIMER armed;
+
+		armed = mshv_tdx_halt_timer_pre(true);
+		if (armed == TIMER_EXPIRED)
+			return;
+
 		hv_vtl_idle();
+
+		mshv_tdx_halt_timer_post(armed);
 	}
 }
 

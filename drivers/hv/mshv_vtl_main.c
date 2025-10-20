@@ -256,6 +256,16 @@ static int mshv_tdx_set_cpumask_from_apicid(int apicid, struct cpumask *cpu_mask
 
 	return -EINVAL;
 }
+
+static long mshv_tdx_vtl_ioctl_check_extension(u32 arg)
+{
+	switch (arg) {
+	case MSHV_CAP_TDX_TSC_DEADLINE:
+		return 1;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
 #endif
 
 static long __mshv_vtl_ioctl_check_extension(u32 arg)
@@ -267,6 +277,15 @@ static long __mshv_vtl_ioctl_check_extension(u32 arg)
 		return mshv_vsm_capabilities.return_action_available;
 	case MSHV_CAP_DR6_SHARED:
 		return mshv_vsm_capabilities.dr6_shared;
+	}
+
+	switch (arg & MSHV_CAP_VENDOR_MASK) {
+#ifdef CONFIG_INTEL_TDX_GUEST
+	case MSHV_CAP_VENDOR_TDX:
+		return mshv_tdx_vtl_ioctl_check_extension(arg);
+#endif
+	default:
+		break;
 	}
 
 	return -EOPNOTSUPP;
